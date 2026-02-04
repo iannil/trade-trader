@@ -14,19 +14,31 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+from __future__ import annotations
+
 import logging
-from trade_trader.utils.read_config import *
+import os
+
+from trade_trader.utils.read_config import app_dir, config
 
 
-def get_my_logger(logger_name='main'):
+def get_my_logger(logger_name: str = 'main') -> logging.Logger:
+    """Get a configured logger instance.
+
+    Args:
+        logger_name: Name of the logger (default: 'main')
+
+    Returns:
+        Configured logger instance.
+    """
     logger = logging.getLogger(logger_name)
     if logger.handlers:
         return logger
-    log_file = os.path.join(app_dir.user_log_dir, '{}.log'.format(logger_name))
+    log_file = os.path.join(app_dir.user_log_dir, f'{logger_name}.log')
     if not os.path.exists(app_dir.user_log_dir):
         os.makedirs(app_dir.user_log_dir)
-    formatter = logging.Formatter(config.get('LOG', 'format',
-                                             fallback="%(asctime)s %(name)s [%(levelname)s] %(message)s"))
+    formatter = logging.Formatter(
+        config.get('LOG', 'format', fallback='%(asctime)s %(name)s [%(levelname)s] %(message)s'))
     file_handler = logging.FileHandler(log_file, encoding='utf-8')
     file_handler.setFormatter(formatter)
     console_handler = logging.StreamHandler()

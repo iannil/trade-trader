@@ -23,3 +23,9 @@ huggingface_hub
 matplotlib
 safetensors
 sshtunnel
+
+# Testing
+pytest
+pytest-asyncio
+pytest-cov
+pytest-mock

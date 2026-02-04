@@ -13,6 +13,8 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+from __future__ import annotations
+
 import logging
 import ujson as json
 from decimal import Decimal
@@ -26,6 +28,7 @@ from functools import reduce
 from itertools import combinations
 
 import pytz
+import pandas as pd
 import aiohttp
 from django.db.models import Q, F, Max, Min
 from django.utils import timezone
@@ -33,7 +36,20 @@ import redis
 from talib import ATR
 from tqdm import tqdm
 
-from panel.models import *
+from panel.models import (
+    Instrument,
+    DailyBar,
+    MainBar,
+    Strategy,
+    Trade,
+    Signal,
+    ExchangeType,
+    DirectionType,
+    SignalType,
+    PriorityType,
+)
+from panel.const import DCE_NAME_CODE
+from panel.models import to_df
 from trade_trader.utils import ApiStruct
 from trade_trader.utils.read_config import config
 
@@ -71,9 +87,9 @@ def price_round(x: Decimal, base: Decimal):
     :param base: Decimal 最小精度
     :return: float 取整结果
     """
-    if not type(x) is Decimal:
+    if type(x) is not Decimal:
         x = Decimal(x)
-    if not type(base) is Decimal:
+    if type(base) is not Decimal:
         base = Decimal(base)
     precision = 0
     s = str(round(base, 3) % 1)
@@ -422,26 +438,26 @@ def calc_main_inst(inst: Instrument, day: datetime.datetime):
 
 
 def create_main(inst: Instrument):
-    print('processing ', inst.product_code)
+    logger.info('processing %s', inst.product_code)
     if inst.change_time is None:
         for day in DailyBar.objects.filter(
                 # time__gte=datetime.datetime.strptime('20211211', '%Y%m%d'),
                 exchange=inst.exchange, code__regex='^{}[0-9]+'.format(inst.product_code)).order_by(
                 'time').values_list('time', flat=True).distinct():
-            print(day, calc_main_inst(inst, timezone.make_aware(datetime.datetime.combine(day, datetime.time.min))))
+            logger.debug('%s %s', day, calc_main_inst(inst, timezone.make_aware(datetime.datetime.combine(day, datetime.time.min))))
     else:
         for day in DailyBar.objects.filter(
                 time__gt=inst.change_time,
                 exchange=inst.exchange, code__regex='^{}[0-9]+'.format(inst.product_code)).order_by(
                 'time').values_list('time', flat=True).distinct():
-            print(day, calc_main_inst(inst, timezone.make_aware(datetime.datetime.combine(day, datetime.time.min))))
+            logger.debug('%s %s', day, calc_main_inst(inst, timezone.make_aware(datetime.datetime.combine(day, datetime.time.min))))
     return True
 
 
 def create_main_all():
     for inst in Instrument.objects.all():
         create_main(inst)
-    print('all done!')
+    logger.info('all done!')
 
 
 def is_auction_time(inst: Instrument, status: dict):
@@ -493,8 +509,8 @@ def find_best_score(n: int = 20):
         score = (round((1 - (score_df.abs() ** 2).mean()[0]) * 100, 3) - 50) * 2
         result.append((score, ','.join(code_list)))
     result.sort(key=lambda tup: tup[0])
-    print('得分最高: ', result[-3:])
-    print('得分最低: ', result[:3])
+    logger.info('得分最高: %s', result[-3:])
+    logger.info('得分最低: %s', result[:3])
 
 
 def calc_history_signal(inst: Instrument, day: datetime.datetime, strategy: Strategy):
@@ -602,9 +618,9 @@ def calc_history_signal(inst: Instrument, day: datetime.datetime, strategy: Stra
 
 def calc_his_all(day: datetime.datetime):
     strategy = Strategy.objects.get(name='大哥2.0')
-    print(f'calc_his_all day: {day} stragety: {strategy}')
+    logger.info('calc_his_all day: %s strategy: %s', day, strategy)
     for inst in strategy.instruments.all():
-        print('process', inst)
+        logger.debug('process %s', inst)
         last_day = Trade.objects.filter(instrument=inst, close_time__isnull=True).values_list(
             'open_time', flat=True).first()
         if last_day is None:
@@ -643,7 +659,7 @@ async def clean_daily_bar():
     for day, trading in trading_days:
         if not trading:
             DailyBar.objects.filter(time=day.date()).delete()
-    print('done!')
+    logger.info('done!')
 
 
 def load_kt_data(directory: str = r'D:\test'):
@@ -656,7 +672,7 @@ def load_kt_data(directory: str = r'D:\test'):
                 continue
             code = filename.split('9', maxsplit=1)[0]
             inst = Instrument.objects.get(product_code=code)
-            print('process', inst)
+            logger.debug('process %s', inst)
             cur_main = last_main = change_time = None
             insert_list = []
             with open(os.path.join(directory, filename)) as f:

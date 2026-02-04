@@ -2,20 +2,24 @@ import sys
 import os
 import datetime
 import asyncio
-import pytz
+import logging
 
 from tqdm import tqdm
 import django
 
-from trade_trader.utils.read_config import get_dashboard_path
+logger = logging.getLogger(__name__)
+
+from trade_trader.utils.read_config import get_dashboard_path  # noqa: E402
 
 sys.path.append(get_dashboard_path())
 os.environ["DJANGO_SETTINGS_MODULE"] = "dashboard.settings"
 os.environ["DJANGO_ALLOW_ASYNC_UNSAFE"] = "true"
 django.setup()
-from trade_trader.utils import is_trading_day, update_from_shfe, update_from_dce, update_from_czce, update_from_cffex, \
-    create_main_all, check_trading_day
-from django.utils import timezone
+from trade_trader.utils import (  # noqa: E402
+    update_from_shfe, update_from_dce, update_from_czce, update_from_cffex,
+    update_from_gfex, create_main_all, check_trading_day
+)
+from django.utils import timezone  # noqa: E402
 
 
 async def fetch_bar(days=365):
@@ -39,12 +43,13 @@ async def fetch_bar(days=365):
     for day, trading in trading_days:
         if trading:
             tasks += [
-                asyncio.ensure_future(update_from_shfe(day)),
-                asyncio.ensure_future(update_from_dce(day)),
-                asyncio.ensure_future(update_from_czce(day)),
-                asyncio.ensure_future(update_from_cffex(day)),
+                asyncio.create_task(update_from_shfe(day)),
+                asyncio.create_task(update_from_dce(day)),
+                asyncio.create_task(update_from_czce(day)),
+                asyncio.create_task(update_from_cffex(day)),
+                asyncio.create_task(update_from_gfex(day)),
             ]
-    print('task len=', len(tasks))
+    logger.info('task count: %d', len(tasks))
     for f in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
         await f
 

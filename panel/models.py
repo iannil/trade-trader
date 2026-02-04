@@ -13,13 +13,27 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+from __future__ import annotations
+
 import pandas as pd
 from pandas.io.sql import read_sql_query
 from django.db import models
 from django.db import connection
 from django.core.exceptions import EmptyResultSet
 
-from .const import *
+from panel.const import (
+    AddressType,
+    OperatorType,
+    ContractType,
+    ExchangeType,
+    SectionType,
+    SortType,
+    DirectionType,
+    OffsetFlag,
+    OrderStatus,
+    SignalType,
+    PriorityType,
+)
 
 
 def to_df(queryset, index_col=None, parse_dates=None):
@@ -234,6 +248,30 @@ class DailyBar(models.Model):
         return '{}.{}'.format(self.exchange, self.code)
 
 
+class MinuteBar(models.Model):
+    """分钟K线"""
+    exchange = models.CharField('交易所', max_length=8, choices=ExchangeType.choices)
+    code = models.CharField('合约代码', max_length=16, db_index=True)
+    time = models.DateTimeField('时间', db_index=True)
+    open = models.DecimalField(max_digits=12, decimal_places=3, verbose_name='开盘价')
+    high = models.DecimalField(max_digits=12, decimal_places=3, verbose_name='最高价')
+    low = models.DecimalField(max_digits=12, decimal_places=3, verbose_name='最低价')
+    close = models.DecimalField(max_digits=12, decimal_places=3, verbose_name='收盘价')
+    volume = models.IntegerField('成交量')
+    open_interest = models.DecimalField(max_digits=12, decimal_places=3, verbose_name='持仓量', null=True, blank=True)
+
+    class Meta:
+        verbose_name = '分钟K线'
+        verbose_name_plural = '分钟K线列表'
+        indexes = [
+            models.Index(fields=['code', 'time']),
+            models.Index(fields=['-time']),
+        ]
+
+    def __str__(self):
+        return f'{self.exchange}.{self.code} {self.time.strftime("%H:%M")}'
+
+
 class Order(models.Model):
     broker = models.ForeignKey(Broker, verbose_name='账户', on_delete=models.CASCADE)
     strategy = models.ForeignKey(Strategy, verbose_name='策略', on_delete=models.SET_NULL, null=True, blank=True)
@@ -286,3 +324,342 @@ class Trade(models.Model):
 
     def __str__(self):
         return '{}{}{}手'.format(self.instrument, self.direction, self.shares)
+
+
+class Account(models.Model):
+    """账户资金模型"""
+    broker = models.OneToOneField(Broker, verbose_name='账户', on_delete=models.CASCADE, primary_key=True)
+    balance = models.DecimalField('静态权益', max_digits=14, decimal_places=2, default=0)
+    available = models.DecimalField('可用资金', max_digits=14, decimal_places=2, default=0)
+    margin = models.DecimalField('占用保证金', max_digits=14, decimal_places=2, default=0)
+    frozen_margin = models.DecimalField('冻结保证金', max_digits=14, decimal_places=2, default=0)
+    commission = models.DecimalField('手续费', max_digits=14, decimal_places=2, default=0)
+    position_profit = models.DecimalField('持仓盈亏', max_digits=14, decimal_places=2, default=0)
+    close_profit = models.DecimalField('平仓盈亏', max_digits=14, decimal_places=2, default=0)
+    update_time = models.DateTimeField('更新时间', auto_now=True)
+
+    class Meta:
+        verbose_name = '账户资金'
+        verbose_name_plural = '账户资金列表'
+
+    def __str__(self):
+        return f"{self.broker.name} 可用:{self.available}"
+
+    @property
+    def risk_ratio(self) -> float:
+        """风险度 = 占用保证金 / 静态权益"""
+        if self.balance > 0:
+            return float(self.margin / self.balance)
+        return 0.0
+
+    @property
+    def total_asset(self) -> float:
+        """总资产 = 静态权益 + 持仓盈亏"""
+        return float(self.balance + self.position_profit)
+
+
+class Position(models.Model):
+    """持仓模型"""
+    broker = models.ForeignKey(Broker, verbose_name='账户', on_delete=models.CASCADE)
+    strategy = models.ForeignKey(Strategy, verbose_name='策略', on_delete=models.SET_NULL, null=True, blank=True)
+    instrument = models.ForeignKey(Instrument, verbose_name='品种', on_delete=models.CASCADE)
+    code = models.CharField('合约代码', max_length=16, null=True, blank=True)
+    direction = models.CharField('方向', max_length=8, choices=DirectionType.choices)
+    position = models.IntegerField('持仓手数', default=0)
+    frozen = models.IntegerField('冻结手数', default=0)
+    avg_open_price = models.DecimalField('开仓均价', max_digits=12, decimal_places=3, null=True, blank=True)
+    position_cost = models.DecimalField('持仓成本', max_digits=14, decimal_places=2, default=0)
+    margin = models.DecimalField('占用保证金', max_digits=14, decimal_places=2, default=0)
+    frozen_margin = models.DecimalField('冻结保证金', max_digits=14, decimal_places=2, default=0)
+    margin_per_hand = models.DecimalField('每手保证金', max_digits=12, decimal_places=2, default=0)
+    position_profit = models.DecimalField('持仓盈亏', max_digits=14, decimal_places=2, default=0)
+    open_date = models.DateTimeField('开仓日期', null=True, blank=True)
+    update_time = models.DateTimeField('更新时间', auto_now=True)
+
+    class Meta:
+        verbose_name = '持仓'
+        verbose_name_plural = '持仓列表'
+        unique_together = [['broker', 'instrument', 'direction']]
+
+    def __str__(self):
+        return f"{self.instrument} {self.get_direction_display()} {self.position}手"
+
+
+class StopOrder(models.Model):
+    """止损止盈单模型"""
+    position = models.OneToOneField(Position, verbose_name='持仓', on_delete=models.CASCADE)
+    stop_type = models.CharField('止损类型', max_length=16, default='percentage',
+                                  choices=[
+                                      ('fixed_price', '固定价格'),
+                                      ('percentage', '百分比'),
+                                      ('atr', 'ATR倍数'),
+                                      ('trailing', '移动止损'),
+                                      ('time', '时间止损'),
+                                  ])
+    direction = models.CharField('方向', max_length=8, choices=DirectionType.choices)
+
+    # 固定价格止损
+    stop_price = models.DecimalField('止损价格', max_digits=12, decimal_places=3, null=True, blank=True)
+    take_profit_price = models.DecimalField('止盈价格', max_digits=12, decimal_places=3, null=True, blank=True)
+
+    # 百分比止损
+    stop_percentage = models.DecimalField('止损百分比', max_digits=6, decimal_places=4, null=True, blank=True)
+    take_profit_percentage = models.DecimalField('止盈百分比', max_digits=6, decimal_places=4, null=True, blank=True)
+
+    # ATR止损
+    atr_multiple = models.DecimalField('ATR倍数', max_digits=6, decimal_places=2, null=True, blank=True)
+    atr_period = models.IntegerField('ATR周期', null=True, blank=True)
+
+    # 移动止损
+    trailing_distance = models.DecimalField('移动距离', max_digits=12, decimal_places=3, null=True, blank=True)
+    trailing_distance_pct = models.DecimalField('移动距离百分比', max_digits=6, decimal_places=4, null=True, blank=True)
+    highest_price = models.DecimalField('最高价(多头)', max_digits=12, decimal_places=3, null=True, blank=True)
+    lowest_price = models.DecimalField('最低价(空头)', max_digits=12, decimal_places=3, null=True, blank=True)
+
+    # 时间止损
+    exit_time = models.DateTimeField('预期平仓时间', null=True, blank=True)
+
+    # 状态
+    is_active = models.BooleanField('是否激活', default=True)
+    is_triggered = models.BooleanField('是否触发', default=False)
+    triggered_time = models.DateTimeField('触发时间', null=True, blank=True)
+
+    create_time = models.DateTimeField('创建时间', auto_now_add=True)
+    update_time = models.DateTimeField('更新时间', auto_now=True)
+
+    class Meta:
+        verbose_name = '止损止盈单'
+        verbose_name_plural = '止损止盈单列表'
+
+    def __str__(self):
+        return f"{self.position.instrument} {self.stop_type} 止损:{self.stop_price}"
+
+
+class RiskMonitor(models.Model):
+    """风险监控记录"""
+    broker = models.ForeignKey(Broker, verbose_name='账户', on_delete=models.CASCADE)
+    strategy = models.ForeignKey(Strategy, verbose_name='策略', on_delete=models.SET_NULL, null=True, blank=True)
+    check_time = models.DateTimeField('检查时间', auto_now_add=True)
+
+    # 账户风险指标
+    balance = models.DecimalField('静态权益', max_digits=14, decimal_places=2, default=0)
+    available = models.DecimalField('可用资金', max_digits=14, decimal_places=2, default=0)
+    margin = models.DecimalField('占用保证金', max_digits=14, decimal_places=2, default=0)
+    risk_ratio = models.DecimalField('风险度', max_digits=6, decimal_places=4, default=0)
+
+    # 持仓统计
+    total_position_value = models.DecimalField('总持仓市值', max_digits=16, decimal_places=2, default=0)
+    total_profit = models.DecimalField('总浮动盈亏', max_digits=14, decimal_places=2, default=0)
+    long_position_count = models.IntegerField('多头持仓数', default=0)
+    short_position_count = models.IntegerField('空头持仓数', default=0)
+
+    # 风险事件
+    risk_level = models.CharField('风险等级', max_length=8, choices=[
+        ('safe', '安全'),
+        ('warning', '预警'),
+        ('danger', '危险'),
+        ('critical', '紧急'),
+    ], default='safe')
+    warning_message = models.TextField('预警信息', blank=True)
+    alert_sent = models.BooleanField('已发送告警', default=False)
+
+    # 止损统计
+    active_stop_orders = models.IntegerField('激活止损单数', default=0)
+    triggered_stops_today = models.IntegerField('今日触发止损数', default=0)
+
+    class Meta:
+        verbose_name = '风险监控'
+        verbose_name_plural = '风险监控列表'
+        ordering = ['-check_time']
+        indexes = [
+            models.Index(fields=['-check_time']),
+            models.Index(fields=['risk_level']),
+        ]
+
+    def __str__(self):
+        return f"{self.broker.name} {self.check_time} 风险度:{self.risk_ratio}"
+
+    @classmethod
+    def get_latest_risk(cls, broker):
+        """获取最新的风险监控记录"""
+        return cls.objects.filter(broker=broker).order_by('-check_time').first()
+
+    def check_risk_level(self) -> str:
+        """根据风险度计算风险等级"""
+        ratio = float(self.risk_ratio)
+        if ratio >= 0.9:
+            return 'critical'
+        elif ratio >= 0.8:
+            return 'danger'
+        elif ratio >= 0.6:
+            return 'warning'
+        else:
+            return 'safe'
+
+
+class RiskAlert(models.Model):
+    """风险告警记录"""
+    risk_monitor = models.ForeignKey(RiskMonitor, verbose_name='风险监控', on_delete=models.CASCADE)
+    alert_time = models.DateTimeField('告警时间', auto_now_add=True)
+    alert_type = models.CharField('告警类型', max_length=16, choices=[
+        ('risk_ratio', '风险度过高'),
+        ('position_limit', '持仓限额'),
+        ('margin_insufficient', '保证金不足'),
+        ('stop_loss', '止损触发'),
+        ('rate_limit', '频率限制'),
+        ('price_limit', '价格异常'),
+        ('system', '系统异常'),
+    ])
+    alert_level = models.CharField('告警级别', max_length=8, choices=[
+        ('info', '信息'),
+        ('warning', '警告'),
+        ('error', '错误'),
+        ('critical', '严重'),
+    ], default='warning')
+    message = models.TextField('告警消息')
+    is_sent = models.BooleanField('已发送', default=False)
+    sent_method = models.CharField('发送方式', max_length=16, blank=True)
+
+    class Meta:
+        verbose_name = '风险告警'
+        verbose_name_plural = '风险告警列表'
+        ordering = ['-alert_time']
+
+    def __str__(self):
+        return f"{self.alert_type} {self.alert_level} {self.alert_time}"
+
+
+class BacktestResult(models.Model):
+    """回测结果"""
+    strategy = models.ForeignKey(Strategy, verbose_name='策略', on_delete=models.CASCADE)
+    run_time = models.DateTimeField('运行时间', auto_now_add=True)
+    name = models.CharField('回测名称', max_length=128, blank=True)
+
+    # 回测参数 (JSON存储)
+    parameters = models.JSONField('回测参数', default=dict, blank=True)
+
+    # 回测区间
+    start_date = models.DateField('开始日期')
+    end_date = models.DateField('结束日期')
+
+    # 资金设置
+    initial_capital = models.DecimalField('初始资金', max_digits=16, decimal_places=2)
+    final_capital = models.DecimalField('最终资金', max_digits=16, decimal_places=2)
+
+    # 交易统计
+    total_trades = models.IntegerField('总交易次数', default=0)
+    winning_trades = models.IntegerField('盈利交易次数', default=0)
+    losing_trades = models.IntegerField('亏损交易次数', default=0)
+    win_rate = models.DecimalField('胜率', max_digits=6, decimal_places=4, default=0)
+
+    # 收益统计
+    total_return = models.DecimalField('总收益率', max_digits=10, decimal_places=4)
+    annual_return = models.DecimalField('年化收益率', max_digits=10, decimal_places=4)
+    max_drawdown = models.DecimalField('最大回撤', max_digits=10, decimal_places=4)
+    max_drawdown_pct = models.DecimalField('最大回撤百分比', max_digits=10, decimal_places=4)
+
+    # 盈亏统计
+    gross_profit = models.DecimalField('总盈利', max_digits=16, decimal_places=2, default=0)
+    gross_loss = models.DecimalField('总亏损', max_digits=16, decimal_places=2, default=0)
+    net_profit = models.DecimalField('净盈利', max_digits=16, decimal_places=2, default=0)
+    avg_profit = models.DecimalField('平均盈利', max_digits=16, decimal_places=2, default=0)
+    avg_loss = models.DecimalField('平均亏损', max_digits=16, decimal_places=2, default=0)
+    profit_factor = models.DecimalField('盈亏比', max_digits=10, decimal_places=4, default=0)
+
+    # 风险指标
+    sharpe_ratio = models.DecimalField('夏普比率', max_digits=10, decimal_places=4, default=0)
+    sortino_ratio = models.DecimalField('索提诺比率', max_digits=10, decimal_places=4, default=0)
+    calmar_ratio = models.DecimalField('卡玛比率', max_digits=10, decimal_places=4, default=0)
+
+    # 权益曲线数据 (JSON存储)
+    equity_curve = models.JSONField('权益曲线', blank=True, null=True)
+
+    # 备注
+    notes = models.TextField('备注', blank=True)
+
+    class Meta:
+        verbose_name = '回测结果'
+        verbose_name_plural = '回测结果列表'
+        ordering = ['-run_time']
+        indexes = [
+            models.Index(fields=['-run_time']),
+            models.Index(fields=['strategy']),
+            models.Index(fields=['start_date', 'end_date']),
+        ]
+
+    def __str__(self):
+        return f"{self.strategy.name} {self.start_date} - {self.end_date} 收益:{self.total_return:.2%}"
+
+    @property
+    def duration_days(self) -> int:
+        """回测持续天数"""
+        return (self.end_date - self.start_date).days
+
+
+class BacktestTrade(models.Model):
+    """回测交易记录"""
+    backtest = models.ForeignKey(BacktestResult, verbose_name='回测结果', on_delete=models.CASCADE, related_name='trades')
+    instrument = models.ForeignKey(Instrument, verbose_name='品种', on_delete=models.CASCADE)
+    code = models.CharField('合约代码', max_length=16)
+
+    direction = models.CharField('方向', max_length=8, choices=DirectionType.choices)
+    entry_time = models.DateTimeField('开仓时间')
+    exit_time = models.DateTimeField('平仓时间', null=True, blank=True)
+
+    entry_price = models.DecimalField('开仓价格', max_digits=12, decimal_places=3)
+    exit_price = models.DecimalField('平仓价格', max_digits=12, decimal_places=3, null=True, blank=True)
+    volume = models.IntegerField('手数')
+
+    profit = models.DecimalField('盈亏', max_digits=16, decimal_places=2, null=True, blank=True)
+    profit_pct = models.DecimalField('盈亏百分比', max_digits=10, decimal_places=4, null=True, blank=True)
+
+    exit_reason = models.CharField('平仓原因', max_length=32, blank=True)
+
+    class Meta:
+        verbose_name = '回测交易记录'
+        verbose_name_plural = '回测交易记录列表'
+        ordering = ['entry_time']
+
+    def __str__(self):
+        return f"{self.code} {self.get_direction_display()} {self.volume}手 盈亏:{self.profit}"
+
+
+class StrategyInstance(models.Model):
+    """策略实例 - 用于多策略管理"""
+    strategy = models.ForeignKey(Strategy, verbose_name='策略模板', on_delete=models.CASCADE)
+    name = models.CharField('实例名称', max_length=64)
+    broker = models.ForeignKey(Broker, verbose_name='账户', on_delete=models.CASCADE)
+
+    # 状态
+    is_active = models.BooleanField('是否激活', default=True)
+    status = models.CharField('状态', max_length=16, choices=[
+        ('stopped', '已停止'),
+        ('running', '运行中'),
+        ('paused', '已暂停'),
+        ('error', '错误'),
+    ], default='stopped')
+
+    # 资金分配
+    allocated_capital = models.DecimalField('分配资金', max_digits=16, decimal_places=2, default=0)
+    capital_ratio = models.DecimalField('资金比例', max_digits=6, decimal_places=4, default=1)
+
+    # 参数 (JSON存储，覆盖策略模板参数)
+    parameters = models.JSONField('参数设置', default=dict, blank=True)
+
+    # 统计
+    total_trades = models.IntegerField('总交易次数', default=0)
+    total_profit = models.DecimalField('总盈亏', max_digits=16, decimal_places=2, default=0)
+
+    start_time = models.DateTimeField('启动时间', null=True, blank=True)
+    stop_time = models.DateTimeField('停止时间', null=True, blank=True)
+    create_time = models.DateTimeField('创建时间', auto_now_add=True)
+    update_time = models.DateTimeField('更新时间', auto_now=True)
+
+    class Meta:
+        verbose_name = '策略实例'
+        verbose_name_plural = '策略实例列表'
+        ordering = ['-create_time']
+        unique_together = [['strategy', 'name']]
+
+    def __str__(self):
+        return f"{self.name} ({self.strategy.name})"

@@ -22,11 +22,11 @@ sys.path.append(get_dashboard_path())
 os.environ["DJANGO_SETTINGS_MODULE"] = "dashboard.settings"
 os.environ["DJANGO_ALLOW_ASYNC_UNSAFE"] = "true"
 django.setup()
-import redis
-import logging
-from logging import handlers
-from trade_trader.strategy.brother2 import TradeStrategy
-from trade_trader.utils.read_config import config_file, app_dir, config
+import redis  # noqa: E402
+import logging  # noqa: E402
+from logging import handlers  # noqa: E402
+from trade_trader.strategy.brother2 import TradeStrategy  # noqa: E402
+from trade_trader.utils.read_config import config_file, app_dir, config  # noqa: E402
 
 
 class RedislHandler(logging.StreamHandler):
@@ -51,12 +51,12 @@ if __name__ == '__main__':
     file_handler.setLevel(config.get('LOG', 'file_level', fallback='DEBUG'))
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(general_formatter)
-    console_handler.setLevel('DEBUG')
+    console_handler.setLevel(config.get('LOG', 'console_level', fallback='DEBUG'))
     redis_handler = RedislHandler(config.get('MSG_CHANNEL', 'weixin_log'))
     redis_handler.setFormatter(config.get('LOG', 'weixin_format'))
     redis_handler.setLevel(config.get('LOG', 'flower_level', fallback='INFO'))
     logger = logging.getLogger()
-    logger.setLevel('DEBUG')
+    logger.setLevel(config.get('LOG', 'root_level', fallback='DEBUG'))
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     logger.addHandler(redis_handler)
@@ -67,8 +67,8 @@ if __name__ == '__main__':
             os.makedirs(app_dir.user_cache_dir)
     with open(pid_path, 'w') as pid_file:
         pid_file.write(str(os.getpid()))
-    print('Big Brother is watching you!')
-    print('used config file:', config_file)
-    print('log stored in:', app_dir.user_log_dir)
-    print('pid file:', pid_path)
+    logger.info('Big Brother is watching you!')
+    logger.info('used config file: %s', config_file)
+    logger.info('log stored in: %s', app_dir.user_log_dir)
+    logger.info('pid file: %s', pid_path)
     TradeStrategy(name='大哥2.2').run()

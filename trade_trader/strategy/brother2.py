@@ -19,17 +19,40 @@ from collections import defaultdict
 import datetime
 from decimal import Decimal
 import logging
+from typing import Optional
 from django.db.models import Q, F, Sum
 from django.utils import timezone
 from talib import ATR
 import ujson as json
-import aioredis
+import redis.asyncio as aioredis
 from trade_trader.strategy import BaseModule
 from trade_trader.utils.func_container import RegisterCallback
 from trade_trader.utils.read_config import config, ctp_errors
 from trade_trader.utils import ApiStruct, price_round, is_trading_day, update_from_shfe, update_from_dce, update_from_czce, update_from_cffex, \
     get_contracts_argument, calc_main_inst, str_to_number, get_next_id, ORDER_REF_SIGNAL_ID_START, update_from_gfex
-from panel.models import *
+from trade_trader.risk import RiskEngine, create_risk_engine
+from trade_trader.risk.stop_engine import StopEngine, create_stop_engine
+from panel.models import (
+    Autonumber,
+    Strategy,
+    Instrument,
+    DailyBar,
+    MainBar,
+    Trade,
+    Signal,
+    Order,
+    Account,
+    Performance,
+    ExchangeType,
+    DirectionType,
+    OffsetFlag,
+    CombOffsetFlag,
+    OrderStatus,
+    OrderSubmitStatus,
+    SignalType,
+    PriorityType,
+)
+from panel.models import to_df
 
 logger = logging.getLogger('CTPApi')
 HANDLER_TIME_OUT = config.getint('TRADE', 'command_timeout', fallback=10)
@@ -60,6 +83,20 @@ class TradeStrategy(BaseModule):
         self.__re_extract_name = re.compile('(.*?)([0-9]+)(.*?)$')  # 提取合约文字部分
         self.__trading_day = timezone.make_aware(datetime.datetime.strptime(self.raw_redis.get("TradingDay") + '08', '%Y%m%d%H'))
         self.__last_trading_day = timezone.make_aware(datetime.datetime.strptime(self.raw_redis.get("LastTradingDay") + '08', '%Y%m%d%H'))
+
+        # 初始化风控引擎
+        self._risk_engine: Optional[RiskEngine] = None
+        self._stop_engine: Optional[StopEngine] = None
+        self._risk_enabled = config.getboolean('RISK', 'enabled', fallback=True)
+
+        if self._risk_enabled:
+            try:
+                self._risk_engine = create_risk_engine(self.__broker)
+                self._stop_engine = create_stop_engine(self.__strategy, self.__broker)
+                logger.info(f"风控引擎已启用: RiskEngine={self._risk_engine is not None}, StopEngine={self._stop_engine is not None}")
+            except Exception as e:
+                logger.warning(f'风控引擎初始化失败: {repr(e)}', exc_info=True)
+                self._risk_enabled = False
 
     async def start(self):
         await self.install()
@@ -181,7 +218,7 @@ class TradeStrategy(BaseModule):
                     valid_name = ''
                 inst_data['name'] = valid_name
                 inst, created = Instrument.objects.update_or_create(product_code=code)
-                print(f"inst:{inst} created:{created} main_code:{inst.main_code}")
+                logger.debug(f"inst:{inst} created:{created} main_code:{inst.main_code}")
                 update_field_list = list()
                 # 更新主力合约的保证金和手续费
                 if inst.main_code:
@@ -300,6 +337,13 @@ class TradeStrategy(BaseModule):
 
     def ReqOrderInsert(self, sig: Signal):
         try:
+            # 风控检查
+            if self._risk_enabled and self._risk_engine:
+                risk_check = self._check_order_risk(sig)
+                if not risk_check.passed:
+                    logger.warning(f"风控拒绝订单: {sig.instrument} {sig.type} {sig.volume}手 @{sig.price} - {risk_check.message}")
+                    return
+
             request_id = get_next_id()
             autoid = Autonumber.objects.create()
             order_ref = f"{autoid.id:07}{sig.id:05}"
@@ -341,6 +385,90 @@ class TradeStrategy(BaseModule):
             self.raw_redis.publish(self.__request_format.format('ReqOrderInsert'), json.dumps(param_dict))
         except Exception as e:
             logger.warning(f'ReqOrderInsert 发生错误: {repr(e)}', exc_info=True)
+
+    def _check_order_risk(self, sig: Signal):
+        """
+        报单前风控检查
+
+        Args:
+            sig: 交易信号
+
+        Returns:
+            RiskCheckResult: 风控检查结果
+        """
+        try:
+            # 获取合约信息
+            inst = sig.instrument
+            if not inst:
+                return self._risk_engine.RiskCheckResult(
+                    False, "合约信息不存在", self._risk_engine.ERR_INSTRUMENT_STATUS
+                )
+
+            # 确定订单方向和开平标志
+            direction = None
+            offset = None
+
+            match sig.type:
+                case SignalType.BUY:
+                    direction = DirectionType.LONG
+                    offset = OffsetFlag.Open
+                case SignalType.SELL_SHORT:
+                    direction = DirectionType.SHORT
+                    offset = OffsetFlag.Open
+                case SignalType.BUY_COVER:
+                    direction = DirectionType.LONG
+                    offset = OffsetFlag.Close
+                case SignalType.SELL:
+                    direction = DirectionType.SHORT
+                    offset = OffsetFlag.Close
+                case SignalType.ROLL_OPEN:
+                    # 换月开新 - 根据原持仓方向判断
+                    pos = Trade.objects.filter(
+                        Q(close_time__isnull=True) | Q(close_time__date__gte=timezone.localtime().now().date()),
+                        broker=self.__broker, strategy=self.__strategy, code=inst.last_main, shares=sig.volume
+                    ).first()
+                    if pos:
+                        direction = pos.direction
+                    else:
+                        direction = DirectionType.LONG  # 默认
+                    offset = OffsetFlag.Open
+                case SignalType.ROLL_CLOSE:
+                    # 换月平旧 - 根据持仓方向判断
+                    pos = Trade.objects.filter(
+                        broker=self.__broker, strategy=self.__strategy, code=sig.code, shares=sig.volume, close_time__isnull=True
+                    ).first()
+                    if pos:
+                        direction = pos.direction
+                    else:
+                        direction = DirectionType.LONG  # 默认
+                    offset = OffsetFlag.Close
+
+            if direction is None:
+                return self._risk_engine.RiskCheckResult(
+                    False, "无法确定订单方向", self._risk_engine.ERR_INSTRUMENT_STATUS
+                )
+
+            # 获取账户信息
+            account = Account.objects.filter(broker=self.__broker).first()
+            if account is None:
+                # 如果没有账户记录，创建一个临时账户对象用于风控
+                from trade_trader.risk import RiskCheckResult
+                return RiskCheckResult(True, "无账户记录，跳过风控检查")
+
+            # 调用风控引擎检查
+            return self._risk_engine.check_order_before_submit(
+                instrument=inst,
+                direction=direction,
+                offset=offset,
+                price=sig.price,
+                volume=sig.volume,
+                account=account
+            )
+        except Exception as e:
+            logger.warning(f'风控检查发生错误: {repr(e)}', exc_info=True)
+            # 风控检查失败时，默认拒绝订单
+            from trade_trader.risk import RiskCheckResult
+            return RiskCheckResult(False, f"风控检查异常: {repr(e)}", "RISK_ERROR")
 
     async def cancel_order(self, order: dict):
         sub_client = None
@@ -581,7 +709,7 @@ class TradeStrategy(BaseModule):
                 logger.info(f'发现日盘信号: {sig}')
                 self.io_loop.call_soon(self.ReqOrderInsert, sig)
             if (self.__trading_day - self.__last_trading_day).days > 3:
-                logger.info(f'假期后第一天，处理节前未成交夜盘信号.')
+                logger.info('假期后第一天，处理节前未成交夜盘信号.')
                 self.io_loop.call_soon(asyncio.create_task, self.processing_signal3())
 
     @RegisterCallback(crontab='1 9 * * *')
@@ -832,7 +960,7 @@ class TradeStrategy(BaseModule):
                 risk_each = Decimal(df.atr[idx]) * Decimal(inst.volume_multiple)
                 volume_ori = (start_cash + profit) * risk / risk_each
                 volume = round(volume_ori)
-                print(f"{inst}: ({start_cash:,.0f} + {profit:,.0f}) / {risk_each:,.0f} = {volume_ori}")
+                logger.debug(f"{inst}: ({start_cash:,.0f} + {profit:,.0f}) / {risk_each:,.0f} = {volume_ori}")
                 if volume > 0:
                     new_bar = DailyBar.objects.filter(exchange=inst.exchange, code=inst.main_code, time=day.date()).first()
                     if new_bar is None:
